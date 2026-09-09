@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"syscall"
 	"time"
 
+	"so1.local/daemon202112092/ebpfmonitor"
 	"so1.local/daemon202112092/models"
 	"so1.local/daemon202112092/services"
+	valkeystore "so1.local/daemon202112092/valkey"
 )
 
 /*
@@ -603,7 +606,215 @@ func printPostManagementState(
 	}
 }
 
-func executeCycle() error {
+/*
+registerExpectedRemovals registra los PID que
+el Daemon está a punto de eliminar.
+
+Esto se ejecuta ANTES de docker stop.
+*/
+func registerExpectedRemovals(
+	analysis models.ContainerAnalysis,
+	tracker *ebpfmonitor.Tracker,
+) {
+	tracker.CleanupExpired(
+		30 * time.Second,
+	)
+
+	for _, candidate := range analysis.Candidates {
+
+		pid :=
+			candidate.Container.PID
+
+		if candidate.Container.Process != nil {
+			pid =
+				candidate.Container.Process.PID
+		}
+
+		if pid <= 0 {
+			continue
+		}
+
+		tracker.Expect(
+			ebpfmonitor.PendingDeletion{
+				ContainerID: candidate.Container.ID,
+
+				ContainerName: candidate.Container.Name,
+
+				Profile: candidate.Container.Profile,
+
+				PID: pid,
+
+				Reason: candidate.Reason,
+
+				RegisteredAt: time.Now(),
+			},
+		)
+	}
+}
+
+/*
+confirmRemovedContainers espera la confirmación
+eBPF de cada contenedor que Docker logró eliminar.
+
+Solo después de recibir el evento se registra
+"Contenedor Eliminado" en Valkey.
+*/
+func confirmRemovedContainers(
+	store *valkeystore.Store,
+	tracker *ebpfmonitor.Tracker,
+	result models.ManagementResult,
+) (
+	int,
+	error,
+) {
+	/*
+		Si una eliminación falló, ya no debemos
+		esperar un evento para ese PID.
+	*/
+	for _, action := range result.Failed {
+
+		if action.Action == "REMOVE" &&
+			action.PID > 0 {
+
+			tracker.Cancel(
+				action.PID,
+			)
+		}
+	}
+
+	confirmedCount := 0
+
+	var firstError error
+
+	for _, action := range result.Removed {
+
+		if action.PID <= 0 {
+			continue
+		}
+
+		confirmation, confirmed :=
+			tracker.Wait(
+				action.PID,
+				2*time.Second,
+			)
+
+		if !confirmed {
+
+			fmt.Printf(
+				"[ALERTA eBPF] No se recibio confirmacion para PID=%d contenedor=%s\n",
+				action.PID,
+				action.ContainerName,
+			)
+
+			continue
+		}
+
+		fmt.Println()
+		fmt.Println(
+			"================ CONFIRMACION eBPF ================",
+		)
+
+		fmt.Printf(
+			"Contenedor:     %s\n",
+			action.ContainerName,
+		)
+
+		fmt.Printf(
+			"PID objetivo:   %d\n",
+			confirmation.Event.TargetPID,
+		)
+
+		fmt.Printf(
+			"PID emisor:     %d\n",
+			confirmation.Event.SenderPID,
+		)
+
+		fmt.Printf(
+			"Proceso emisor: %s\n",
+			ebpfmonitor.CommString(
+				confirmation.Event.Comm,
+			),
+		)
+
+		fmt.Printf(
+			"Señal:          %d (%s)\n",
+			confirmation.Event.Signal,
+			ebpfmonitor.SignalName(
+				confirmation.Event.Signal,
+			),
+		)
+
+		fmt.Println(
+			"[OK] Eliminacion confirmada a nivel del Kernel.",
+		)
+
+		deletedEvent :=
+			valkeystore.DeletedEvent{
+				Timestamp: confirmation.ConfirmedAt.
+					Format(time.RFC3339),
+
+				TimestampUnix: confirmation.ConfirmedAt.Unix(),
+
+				ContainerID: action.ContainerID,
+
+				ContainerName: action.ContainerName,
+
+				Profile: action.Profile,
+
+				TargetPID: action.PID,
+
+				SenderPID: confirmation.Event.SenderPID,
+
+				SenderTGID: confirmation.Event.SenderTGID,
+
+				Signal: confirmation.Event.Signal,
+
+				SignalName: ebpfmonitor.SignalName(
+					confirmation.Event.Signal,
+				),
+
+				SenderComm: ebpfmonitor.CommString(
+					confirmation.Event.Comm,
+				),
+
+				Reason: action.Reason,
+			}
+
+		if err :=
+			store.SaveConfirmedDeletion(
+				deletedEvent,
+			); err != nil {
+
+			fmt.Printf(
+				"[ERROR] No se pudo registrar confirmacion en Valkey: %v\n",
+				err,
+			)
+
+			if firstError == nil {
+				firstError = err
+			}
+
+			continue
+		}
+
+		confirmedCount++
+
+		fmt.Println(
+			"[OK] Evento Contenedor Eliminado registrado en Valkey.",
+		)
+
+		fmt.Println(
+			"====================================================",
+		)
+	}
+
+	return confirmedCount, firstError
+}
+
+func executeCycle(
+	store *valkeystore.Store,
+	tracker *ebpfmonitor.Tracker,
+) error {
 	fmt.Println()
 	fmt.Println("====================================================")
 	fmt.Printf(
@@ -695,6 +906,18 @@ func executeCycle() error {
 	)
 
 	/*
+		Registramos los PID candidatos antes de
+		ejecutar docker stop.
+
+		Así el listener eBPF ya sabe qué PID
+		debe considerar válido.
+	*/
+	registerExpectedRemovals(
+		analysis,
+		tracker,
+	)
+
+	/*
 		Ejecutamos ahora las decisiones reales:
 
 		- Crear contenedores faltantes.
@@ -708,6 +931,29 @@ func executeCycle() error {
 
 	printManagementResult(
 		managementResult,
+	)
+
+	/*
+		Solo las eliminaciones confirmadas por eBPF
+		se registran como Contenedor Eliminado.
+	*/
+	confirmedCount, confirmationErr :=
+		confirmRemovedContainers(
+			store,
+			tracker,
+			managementResult,
+		)
+
+	if confirmationErr != nil {
+		fmt.Printf(
+			"[ERROR] Hubo errores registrando confirmaciones eBPF: %v\n",
+			confirmationErr,
+		)
+	}
+
+	fmt.Printf(
+		"[INFO] Eliminaciones confirmadas por eBPF en este ciclo: %d\n",
+		confirmedCount,
 	)
 
 	/*
@@ -737,6 +983,35 @@ func executeCycle() error {
 		postAnalysis,
 	)
 
+	/*
+		Almacenamos en Valkey:
+
+		- Estado general del sistema.
+		- Histórico de RAM.
+		- Top 5 RAM.
+		- Top 5 CPU.
+		- Contenedores activos.
+		- Resultado de gestión.
+
+		Las eliminaciones todavía NO son registradas
+		como confirmadas. Eso se hará con eBPF.
+	*/
+	if err := store.SaveCycle(
+		telemetry,
+		analysis,
+		postAnalysis,
+		managementResult,
+	); err != nil {
+		return fmt.Errorf(
+			"no se pudo almacenar telemetria en Valkey: %w",
+			err,
+		)
+	}
+
+	fmt.Println()
+	fmt.Println(
+		"[OK] Telemetria almacenada correctamente en Valkey.",
+	)
 	fmt.Println()
 	fmt.Printf(
 		"[INFO] Proximo ciclo en %v\n",
@@ -749,7 +1024,6 @@ func executeCycle() error {
 func main() {
 	fmt.Println("====================================================")
 	fmt.Println("DAEMON - PROYECTO 2 SISTEMAS OPERATIVOS 1")
-	fmt.Println("Carnet: 202112092")
 	fmt.Println("====================================================")
 
 	/*
@@ -812,6 +1086,194 @@ func main() {
 	}
 
 	/*
+		Inicializamos la conexión directa con Valkey.
+	*/
+	fmt.Println()
+	fmt.Println("[STARTUP] Conectando Daemon con Valkey...")
+
+	valkeyStore, err :=
+		valkeystore.NewStore(
+			"127.0.0.1:6379",
+		)
+
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"[ERROR] No se pudo inicializar Valkey: %v\n",
+			err,
+		)
+
+		os.Exit(1)
+	}
+
+	/*
+		Cerramos la conexión cuando termine main.
+	*/
+	defer valkeyStore.Close()
+
+	/*
+		Esperamos hasta 10 segundos por si el
+		contenedor acaba de iniciar.
+	*/
+	if err := valkeyStore.WaitUntilReady(
+		10 * time.Second,
+	); err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"[ERROR] %v\n",
+			err,
+		)
+
+		os.Exit(1)
+	}
+
+	fmt.Println(
+		"[OK] Conexion con Valkey establecida correctamente.",
+	)
+
+	/*
+		Inicializamos el Tracker encargado de relacionar
+		las eliminaciones del Daemon con eventos eBPF.
+	*/
+	deletionTracker :=
+		ebpfmonitor.NewTracker()
+
+	/*
+		Construimos automáticamente la ruta del objeto
+		eBPF dentro del proyecto.
+	*/
+	ebpfObjectPath :=
+		filepath.Join(
+			systemManager.ProjectDir,
+			"ebpf",
+			"kill_monitor.bpf.o",
+		)
+
+	fmt.Println()
+	fmt.Println(
+		"[STARTUP] Iniciando monitor eBPF...",
+	)
+
+	fmt.Printf(
+		"[INFO] Objeto: %s\n",
+		ebpfObjectPath,
+	)
+
+	/*
+		Comprobamos que el objeto haya sido compilado.
+	*/
+	if _, err :=
+		os.Stat(
+			ebpfObjectPath,
+		); err != nil {
+
+		fmt.Fprintf(
+			os.Stderr,
+			"[ERROR] No existe el objeto eBPF: %v\n",
+			err,
+		)
+
+		fmt.Fprintln(
+			os.Stderr,
+			"[INFO] Ejecute primero: proyecto2/ebpf/build.sh",
+		)
+
+		os.Exit(1)
+	}
+
+	ebpfMonitor, err :=
+		ebpfmonitor.New(
+			ebpfObjectPath,
+		)
+
+	if err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"[ERROR] No se pudo iniciar eBPF: %v\n",
+			err,
+		)
+
+		os.Exit(1)
+	}
+
+	fmt.Println(
+		"[OK] Programa eBPF cargado.",
+	)
+
+	fmt.Println(
+		"[OK] eBPF adjuntado a sys_enter_kill y signal_generate.",
+	)
+
+	/*
+		El listener se ejecutará simultáneamente
+		con el loop principal del Daemon.
+	*/
+	ebpfDone :=
+		make(chan struct{})
+
+	go func() {
+		defer close(
+			ebpfDone,
+		)
+
+		err :=
+			ebpfMonitor.Listen(
+				func(event ebpfmonitor.Event) {
+
+					/*
+						El Tracker ignora automáticamente
+						todos los kill() que no correspondan
+						a eliminaciones del Daemon.
+					*/
+					if !deletionTracker.Match(
+						event,
+					) {
+						return
+					}
+
+					fmt.Println()
+					fmt.Println(
+						"[eBPF] Evento correlacionado con una eliminacion pendiente.",
+					)
+
+					fmt.Printf(
+						"[eBPF] PID objetivo=%d | señal=%d (%s)\n",
+						event.TargetPID,
+						event.Signal,
+						ebpfmonitor.SignalName(
+							event.Signal,
+						),
+					)
+				},
+			)
+
+		if err != nil {
+			fmt.Printf(
+				"[ERROR] Listener eBPF finalizado con error: %v\n",
+				err,
+			)
+		}
+	}()
+
+	/*
+	   Al salir del Daemon:
+
+	   1. Cerramos Ring Buffer.
+	   2. Desadjuntamos tracepoint.
+	   3. Esperamos que termine el goroutine.
+	*/
+	defer func() {
+
+		ebpfMonitor.Close()
+
+		<-ebpfDone
+
+		fmt.Println(
+			"[OK] Recursos eBPF liberados.",
+		)
+	}()
+
+	/*
 		defer garantiza que al salir normalmente de main
 		intentaremos eliminar el Cronjob.
 	*/
@@ -839,7 +1301,10 @@ func main() {
 	/*
 		Primera lectura inmediata.
 	*/
-	if err := executeCycle(); err != nil {
+	if err := executeCycle(
+		valkeyStore,
+		deletionTracker,
+	); err != nil {
 		fmt.Fprintf(
 			os.Stderr,
 			"[ERROR] Primer ciclo fallido: %v\n",
@@ -860,7 +1325,10 @@ func main() {
 
 		case <-ticker.C:
 
-			if err := executeCycle(); err != nil {
+			if err := executeCycle(
+				valkeyStore,
+				deletionTracker,
+			); err != nil {
 				fmt.Fprintf(
 					os.Stderr,
 					"[ERROR] Ciclo fallido: %v\n",
