@@ -22,6 +22,8 @@ const (
 	KeyDeletedEvents     = "so1:202112092:events:deleted"
 	KeyDeletedCount      = "so1:202112092:events:deleted:count"
 	KeyDeletedCurrent    = "so1:202112092:events:deleted:current"
+	KeyTopRAMHistorical  = "so1:202112092:top:ram:historical"
+	KeyTopCPUHistorical  = "so1:202112092:top:cpu:historical"
 )
 
 /*
@@ -388,6 +390,97 @@ func (store *Store) addSystemHistory(
 }
 
 /*
+rankingMember genera una etiqueta que posteriormente
+Grafana podrá mostrar directamente.
+
+Incluye nombre, PID e ID del contenedor porque el
+enunciado solicita mostrar PID e ID.
+*/
+func rankingMember(
+	container models.ContainerInfo,
+) string {
+	id := container.ID
+
+	if len(id) > 12 {
+		id = id[:12]
+	}
+
+	pid := container.PID
+
+	if container.Process != nil {
+		pid = container.Process.PID
+	}
+
+	return fmt.Sprintf(
+		"%s | PID=%d | ID=%s",
+		container.Name,
+		pid,
+		id,
+	)
+}
+
+/*
+updateHistoricalRanking guarda el consumo máximo
+observado de cada contenedor.
+
+El uso de ZADD GT permite conservar el valor mayor
+registrado históricamente aunque posteriormente
+el contenedor sea eliminado.
+*/
+func (store *Store) updateHistoricalRanking(
+	key string,
+	containers []models.ContainerInfo,
+	metric func(*models.ProcessInfo) float64,
+) error {
+
+	for _, container := range containers {
+
+		if container.Process == nil {
+			continue
+		}
+
+		score := metric(
+			container.Process,
+		)
+
+		member := rankingMember(
+			container,
+		)
+
+		command :=
+			store.client.B().
+				Arbitrary("ZADD").
+				Keys(key).
+				Args(
+					"GT",
+					strconv.FormatFloat(
+						score,
+						'f',
+						6,
+						64,
+					),
+					member,
+				).
+				Build()
+
+		if err :=
+			store.client.Do(
+				store.ctx,
+				command,
+			).Error(); err != nil {
+
+			return fmt.Errorf(
+				"no se pudo actualizar ranking historico %s: %w",
+				key,
+				err,
+			)
+		}
+	}
+
+	return nil
+}
+
+/*
 SaveCycle almacena toda la telemetría necesaria
 después del análisis de un ciclo del Daemon.
 */
@@ -435,6 +528,36 @@ func (store *Store) SaveCycle(
 	topCPU := buildRanking(
 		before.Rankings.ByCPU,
 	)
+
+	/*
+		Ranking histórico por RAM.
+
+		Se utilizan los contenedores existentes ANTES
+		de la gestión para que también queden registrados
+		aquellos que serán eliminados en este ciclo.
+	*/
+	if err := store.updateHistoricalRanking(
+		KeyTopRAMHistorical,
+		before.ProjectContainers,
+		func(process *models.ProcessInfo) float64 {
+			return process.MemoryPercent
+		},
+	); err != nil {
+		return err
+	}
+
+	/*
+		Ranking histórico por CPU.
+	*/
+	if err := store.updateHistoricalRanking(
+		KeyTopCPUHistorical,
+		before.ProjectContainers,
+		func(process *models.ProcessInfo) float64 {
+			return process.CPUPercent
+		},
+	); err != nil {
+		return err
+	}
 
 	if err := store.setJSON(
 		KeyTopRAMCurrent,
@@ -513,6 +636,9 @@ func (store *Store) SaveConfirmedDeletion(
 			event.TimestampUnix,
 			10,
 		),
+
+		"deleted",
+		"1",
 
 		"container_id",
 		event.ContainerID,
