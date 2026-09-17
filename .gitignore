@@ -1,36 +1,29 @@
-# Editores
-.vscode/
-.idea/
+# ==================================================
+# PROYECTO 2 - SISTEMAS OPERATIVOS 1
+# Archivos generados
+# ==================================================
 
-# Temporales
-*.tmp
-*.swp
-*~
+# Daemon Go
+proyecto2/daemon/daemon-so1
+proyecto2/daemon/ebpf-test
+
+# eBPF generados
+proyecto2/ebpf/*.bpf.o
+proyecto2/ebpf/vmlinux.h
 
 # Logs
-*.log
+proyecto2/cron/*.log
 
-# Binarios compilados
-**/codigo/api1/api1
-**/codigo/api2/api2
-**/codigo/api3/api3
+# Kernel module build
+proyecto2/kernel/*.ko
+proyecto2/kernel/*.o
+proyecto2/kernel/*.mod
+proyecto2/kernel/*.mod.c
+proyecto2/kernel/*.mod.o
+proyecto2/kernel/*.cmd
+proyecto2/kernel/.*.cmd
+proyecto2/kernel/Module.symvers
+proyecto2/kernel/modules.order
 
-# Variables y secretos
-.env
-.env.*
-*.pem
-*.key
-*.crt
-
-# Datos persistentes de Zot
-**/zot-registry/
-**/data/
-
-# Máquinas virtuales e instaladores
-*.qcow2
-*.img
-*.iso
-
-# Claves SSH privadas
-id_rsa
-id_ed25519
+# VS Code local
+proyecto2/.vscode/
